@@ -12,3 +12,7 @@
 
 # MZinga local clone
 mzinga/
+
+# Environment files
+.env
+**/.env
