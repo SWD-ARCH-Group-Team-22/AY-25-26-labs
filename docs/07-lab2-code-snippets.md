@@ -567,7 +567,8 @@ async def main():
 
         async with queue.iterator() as messages:
             async for message in messages:
-                async with message.process(requeue_on_timeout=True):
+                # FIX 1: Changed requeue_on_timeout=True to requeue=True
+                async with message.process(requeue=True):
                     try:
                         body = json.loads(message.body.decode())
                         event_data = body.get("data", {})
@@ -592,6 +593,10 @@ async def main():
                         if e.response.status_code == 401:
                             log.warning("Token expired, re-authenticating")
                             token = login()
+                            # FIX 2: Raise the error so the message requeues and 
+                            # processes successfully on the next immediate attempt 
+                            # with the new token.
+                            raise 
                         else:
                             log.error(f"HTTP error processing message: {e}")
                             raise
@@ -623,4 +628,4 @@ python worker.py
 
 ---
 
-**Previous:** [06 — Lab 1 Code Snippets](06-lab1-code-snippets.md) · **Step-by-step guide:** [07 — Lab 2 Step by Step](07-lab2-step-by-step.md)
+**Previous:** [06 — Lab 1 Code Snippets](06-lab1-code-snippets.md) · **Step-by-step guide:** [07 — Lab 2 Step by Step](07-lab2-step-by-step.md) · **Next:** [08 — Lab 3 Step by Step](08-lab3-step-by-step.md)

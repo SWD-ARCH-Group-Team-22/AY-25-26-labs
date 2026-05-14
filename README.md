@@ -17,3 +17,5 @@ Read in order — each document builds on the previous one.
 | 6b | [Lab 1 Code Snippets](docs/06-lab1-code-snippets.md) | All code snippets for Lab 1 with macOS, Linux, and Windows variants |
 | 7 | [Lab 2 Step by Step](docs/07-lab2-step-by-step.md) | REST API worker (core) + event-driven RabbitMQ worker (optional extension) |
 | 7b | [Lab 2 Code Snippets](docs/07-lab2-code-snippets.md) | All code snippets for Lab 2 with macOS, Linux, and Windows variants |
+| 8 | [Lab 3 Step by Step](docs/08-lab3-step-by-step.md) | Observability: structured logging, OpenTelemetry traces and spans, Prometheus metrics |
+| 8b | [Lab 3 Code Snippets](docs/08-lab3-code-snippets.md) | Full instrumented worker with structlog, OpenTelemetry, and Prometheus |
