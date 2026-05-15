@@ -1,27 +1,26 @@
+import atexit
+import logging
 import os
 import smtplib
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
-import logging
-import structlog
-import atexit
 
 import requests
+import structlog
 from dotenv import load_dotenv
+from prometheus_client import start_http_server
 
-from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from prometheus_client import start_http_server
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
-from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.trace import Status, StatusCode
 
 # Load all variables from the local .env file
 load_dotenv()
@@ -41,25 +40,28 @@ SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "1025"))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
 
-# Name of this worker.
-# It will appear in every structured log.
+# Name used to identify this program in logs, traces and metrics
 SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "email-worker")
 
-# Worker version shown in Jaeger
+# Version of this worker
 SERVICE_VERSION = os.getenv("OTEL_SERVICE_VERSION", "1.0.0")
 
-# Jaeger endpoint used to receive traces
+# Jaeger receives traces on this endpoint
 OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv(
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "http://localhost:4318",
 ).rstrip("/")
 
-# Port where the worker exposes its metrics
+# Port used by this worker to expose Prometheus metrics
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "8000"))
+
 
 def add_service_name(_, __, event_dict):
     """
-    Add the worker name to every log.
+    Add the name of this worker to every log.
+
+    In a real system, logs can come from many programs.
+    With this field we immediately know that the log comes from email-worker.
     """
     event_dict["service"] = SERVICE_NAME
     return event_dict
@@ -67,10 +69,11 @@ def add_service_name(_, __, event_dict):
 
 def configure_logging():
     """
-    Configure logs as JSON objects.
+    Configure structured logs.
 
-    Each log will have clear fields like:
-    event, level, timestamp and service.
+    Instead of printing normal text, we print JSON logs.
+    Each log contains info about: time, log level, worker name, and more.
+
     """
     logging.basicConfig(
         format="%(message)s",
@@ -79,10 +82,19 @@ def configure_logging():
 
     structlog.configure(
         processors=[
+            # Add contextual data to the log, if present
             structlog.contextvars.merge_contextvars,
+
+            # Add "service": "email-worker" to every log
             add_service_name,
+
+            # Add the log level, for example "info" or "error"
             structlog.processors.add_log_level,
+
+            # Add the time of the log
             structlog.processors.TimeStamper(fmt="iso"),
+
+            # Print the log as a JSON object
             structlog.processors.JSONRenderer(),
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -92,89 +104,94 @@ def configure_logging():
 
 def configure_tracing():
     """
-    Configure OpenTelemetry tracing.
+    Configure traces to be sent to Jaeger.
 
-    Traces are sent to Jaeger.
-    Each trace shows what the worker did and how long each step took.
+    A trace is like a timeline of what happens while one Communication is processed.
     """
+    # Basic information used by Jaeger to recognize this worker
     resource = Resource.create({
         "service.name": SERVICE_NAME,
         "service.version": SERVICE_VERSION,
     })
 
+    # Create the tracer provider that manages traces
     provider = TracerProvider(resource=resource)
 
+    # Where to send the traces: http://localhost:4318/v1/traces 
     exporter = OTLPSpanExporter(
         endpoint=f"{OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces"
     )
 
+    # We sent spans in groups, not one by one, to reduce overhead
     provider.add_span_processor(BatchSpanProcessor(exporter))
+
+    # Make this tracer provider the one used by the whole program
     trace.set_tracer_provider(provider)
+
+    # When the worker stops, send any traces still waiting
     atexit.register(provider.shutdown)
 
-    # Automatically create spans for all requests calls
+    # Automatically create spans for REST API calls made with requests
     RequestsInstrumentor().instrument()
 
 
 def configure_metrics():
     """
-    Configure Prometheus metrics.
+    Configure metrics.
 
-    The worker exposes metrics at:
-    http://localhost:8000/metrics
+    Metrics are numbers that describe what the worker is doing:
+    how many emails were processed, how many polls were empty,
+    and how long the operations took.
+
+    The worker exposes metrics at: http://localhost:8000/metrics
     """
-    # Start the HTTP server used by Prometheus
+    # Start the HTTP server used by Prometheus (http://localhost:8000/metrics)
     start_http_server(port=PROMETHEUS_PORT, addr="0.0.0.0")
 
     # This reader connects OpenTelemetry metrics to Prometheus
     reader = PrometheusMetricReader()
 
+    # Basic information used by Jaeger to recognize this worker
     resource = Resource.create({
         "service.name": SERVICE_NAME,
         "service.version": SERVICE_VERSION,
     })
-
+    
+    # Create the meter provider that manage metrics
     provider = MeterProvider(
         resource=resource,
         metric_readers=[reader],
     )
 
+    # Make this metrics provider the one used by the whole program
     metrics.set_meter_provider(provider)
 
 
-# Activate JSON logging
+# Activate JSON logging, tracing and metrics
 configure_logging()
-
-# Activate tracing
 configure_tracing()
-
-# Activate metrics
 configure_metrics()
 
-# Logger used by the worker
-logger = structlog.get_logger()
-
-# Tracer used to create spans manually
+# Create a logger, tracer and meter 
+logger = structlog.get_logger() 
 tracer = trace.get_tracer(SERVICE_NAME)
-
-# Meter used to create metrics
 meter = metrics.get_meter(SERVICE_NAME)
 
-# Counts processed emails
+# Counts processed emails (both successful and failed)
 emails_processed_total = meter.create_counter(
     name="emails_processed_total",
     description="Number of processed emails",
     unit="1",
 )
 
-# Measures total processing time
+#  Measures the total time needed to process one Communication
 email_processing_duration_seconds = meter.create_histogram(
     name="email_processing_duration_seconds",
     description="Time spent processing one communication",
     unit="s",
 )
 
-# Measures SMTP sending time
+# Measures only the time spent sending the email through SMTP
 smtp_send_duration_seconds = meter.create_histogram(
     name="smtp_send_duration_seconds",
     description="Time spent sending the email through SMTP",
@@ -198,9 +215,7 @@ def login():
 
     The login endpoint returns a JWT token.
     Once retrieved, the token is stored inside the session headers so that
-    all future requests automatically include:
-
-        Authorization: Bearer <token>
+    all future requests automatically include: Authorization: Bearer <token>
     """
     response = session.post(
         f"{MZINGA_BASE_URL}/api/users/login",
@@ -236,12 +251,13 @@ def api_request(method, path, **kwargs):
 
     response = session.request(method, url, timeout=15, **kwargs)
 
+    # 401 means the token is missing, expired or invalid
     if response.status_code == 401:
         logger.warning("token_expired_retrying_login")
         login()
         response = session.request(method, url, timeout=15, **kwargs)
 
-    # Raise an exception if the request still failed
+    # Raise an exception
     response.raise_for_status()
     return response
 
@@ -250,14 +266,8 @@ def fetch_pending_communications():
     """
     Retrieve all Communication documents whose status is 'pending'.
 
-    The query uses:
-    - where[status][equals]=pending  -> only pending communications
-    - depth=1                        -> resolve relationship fields one level deep
-
     With depth=1, fields such as 'tos', 'ccs', and 'bccs' come back as full
-    user objects, so the worker can read user emails directly from:
-
-        value.email
+    user objects, so the worker can read user emails directly from: value.email
     """
     response = api_request(
         "GET",
@@ -272,10 +282,7 @@ def update_communication_status(doc_id, status):
     """
     Update the status of one Communication document using a PATCH request.
 
-    Example statuses used by the worker:
-    - processing
-    - sent
-    - failed
+    Example statuses used by the worker: 'processing', 'sent', 'failed'
     """
     api_request(
         "PATCH",
@@ -286,27 +293,16 @@ def update_communication_status(doc_id, status):
 
 def extract_emails(ref_list):
     """
-    Extract email addresses from REST API relationship objects.
+    Extract email addresses from tos, ccs or bccs.
 
-    Expected structure with depth=1:
-    {
-        "relationTo": "users",
-        "value": {
-            "id": "...",
-            "email": "user@example.com"
-        }
-    }
-
-    This function is slightly defensive:
-    - if the input is empty, it returns an empty list
-    - if the input is a single dict instead of a list, it converts it to a list
-    - if an entry has no valid value/email, it skips it
+    Some entries may be empty or malformed, so we skip anything invalid.
     """
     emails = []
 
     if not ref_list:
         return emails
 
+    # Sometimes the API may return one object instead of a list
     if isinstance(ref_list, dict):
         ref_list = [ref_list]
 
@@ -327,14 +323,11 @@ def extract_emails(ref_list):
 
 def render_text_leaf(node):
     """
-    Render one Slate text leaf into safe HTML.
+    Convert one text node into safe HTML.
 
-    Supported inline styles:
-    - plain text
-    - bold
-    - italic
+    This handles simple text, bold and italic.
     """
-    # Escape HTML-sensitive characters for safety
+    # Escape special characters to avoid unsafe HTML
     text = escape(node.get("text", ""))
 
     # Apply bold formatting
@@ -350,7 +343,7 @@ def render_text_leaf(node):
 
 def render_nodes(nodes):
     """
-    Render a list of Slate nodes into one HTML string.
+    Convert a list of Slate nodes into one HTML string.
     """
     return "".join(render_node(node) for node in (nodes or []))
 
@@ -359,17 +352,7 @@ def render_node(node):
     """
     Render one Slate node into HTML.
 
-    Supported node types:
-    - paragraph
-    - h1
-    - h2
-    - ul
-    - li
-    - link
-    - text nodes
-
-    If a node type is unknown, the function falls back to returning
-    only the rendered children.
+    If the node type is unknown, we still render its children.
     """
     # Text leaf node
     if "text" in node:
@@ -401,33 +384,34 @@ def render_node(node):
 def send_email(subject, html_body, to_emails, cc_emails, bcc_emails):
     """
     Build and send one HTML email through the configured SMTP server.
-
-    - 'To' and 'Cc' are visible in the email headers
-    - 'Bcc' recipients are only included in the SMTP recipient list
+    
+    Workflow:
+    1. Create the email headers, including Subject, From, To and Cc
+    2. Attach the HTML body to the email
+    3. add all recipient emails, including Bcc, to the SMTP envelope
+    4. Open a connection to the SMTP server and send the email
     """
     msg = MIMEMultipart("alternative")
 
-    # Visible email headers
+    # Step 1: Set visible email headers
     msg["Subject"] = subject or "(no subject)"
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(to_emails)
     msg["Cc"] = ", ".join(cc_emails)
 
-    # Attach the HTML version of the email body
+    # Step 2: Attach the HTML body to the email
     msg.attach(MIMEText(html_body, "html"))
 
-    # Actual recipient list used by SMTP delivery
+    # Step 3: Add all recipient emails, including Bcc, to the SMTP envelope
     all_recipients = to_emails + cc_emails + bcc_emails
 
-    # Open an SMTP connection and send the email
-    # Open an SMTP connection and send the email
+    # Step 4: Open an SMTP connection and send the email
     with tracer.start_as_current_span("send_email") as span:
         span.set_attribute("recipient_count", len(all_recipients))
         span.set_attribute("smtp.host", SMTP_HOST)
         span.set_attribute("smtp.port", SMTP_PORT)
 
         smtp_start_time = time.perf_counter()
-
         try:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
                 server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
@@ -442,12 +426,12 @@ def process_communication(doc):
     Process one Communication document.
 
     Workflow:
-    1. mark the document as 'processing'
-    2. extract recipient emails from tos/ccs/bccs
-    3. convert the Slate body to HTML
-    4. send the email
-    5. mark the document as 'sent' on success
-    6. mark the document as 'failed' if any exception occurs
+    1. Mark the document as 'processing'
+    2. Extract recipient emails from tos/ccs/bccs
+    3. Convert the body from Slate to HTML format
+    4. Send the email
+    5. Mark the document as 'sent' on success
+    6. Mark the document as 'failed' if any exception occurs
     """
     doc_id = doc["id"]
     processing_start_time = time.perf_counter()
@@ -522,6 +506,7 @@ def process_communication(doc):
             update_communication_status(doc_id, "failed")
             logger.error("email_failed", doc_id=doc_id, error=str(e))
             logger.info("status_updated", doc_id=doc_id, status="failed")
+            
             # Record metrics for a failed email
             processing_duration = time.perf_counter() - processing_start_time
             email_processing_duration_seconds.record(processing_duration)
@@ -533,47 +518,56 @@ def process_communication(doc):
                 },
             )
 
+
 def main():
     """
     Main worker loop.
 
     The worker:
-    1. authenticates against the REST API
-    2. polls for pending Communication documents
-    3. processes each pending document
-    4. sleeps for a few seconds
-    5. repeats forever
+    1. Authenticates against the REST API
+    2. Polls for pending Communication documents
+    3. Processes each pending document
+    4. Sleeps for a few seconds
+    5. Repeats forever
     """
     logger.info("worker_started")
 
-    # Perform the initial login before entering the loop
+    # Step 1: authenticate against the REST API to get a valid token
     login()
 
+    # Step 2-5: repeat forever
     while True:
         try:
-            # Fetch all pending communications
+            # Step 2: fetch all pending communications
             pending_docs = fetch_pending_communications()
 
-            # If no pending documents exist, wait and try again later
+            # If no pending documents exist
             if not pending_docs:
+                
+                # Write a log to indicate that the poll found no pending documents
                 logger.info("poll_empty")
+                
+                # Record a metric to count how many times the worker polled with no pending documents
                 worker_poll_total.add(1, {"result": "empty"})
+                
+                # Wait a few seconds before the next poll 
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # If found, log how many pending documents were found
             logger.info("poll_found", count=len(pending_docs))
             worker_poll_total.add(1, {"result": "found"})
 
-            # Process each pending communication one by one
+            # Step 3: Process each pending communication one by one
             for doc in pending_docs:
                 with tracer.start_as_current_span("worker_cycle"):
                     process_communication(doc)
 
+        # If any unexpected exception occurs, log it and continue with the next cycle
         except Exception as e:
-            # Catch unexpected errors in the main loop so the worker keeps running
             logger.error("worker_loop_failed", error=str(e))
 
-        # Wait before the next polling cycle
+        # Step 4: Wait few seconds before the next polling cycle
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
